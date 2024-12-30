@@ -1,0 +1,1589 @@
+import win32com.client
+import re
+import os
+import paramiko
+import pdfplumber
+from PyPDF2 import PdfReader
+import google.generativeai as genai
+import pandas as pd
+import json
+import logging
+from requests.auth import HTTPBasicAuth
+from datetime import datetime
+import traceback
+import decimal
+from decimal import Decimal
+import requests
+from datetime import datetime
+from selenium import webdriver
+import time
+import win32com.client as win32
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+import imaplib
+import email
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from email.mime.base import MIMEBase
+from email import encoders
+
+
+# Set your Google API key directly in the script
+GOOGLE_API_KEY = "AIzaSyC1W9mbvwhkm"
+
+# Configure the API
+genai.configure(api_key=GOOGLE_API_KEY)
+
+# Configure logging
+import logging
+
+# Configure logging
+logging.basicConfig(filename='auto_invoice_process_log.log', level=logging.DEBUG,
+                    format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Configure logging to log to both file and console
+console_handler = logging.StreamHandler()
+logging.getLogger().addHandler(console_handler)
+
+# Now you can log messages
+logging.info("Logging system is configured")
+
+# Add the console handler to the root logger
+# logging.getLogger().addHandler(console_handler)
+
+# Define the directory for saving attachments
+SAVE_DIR = "C:\\Invoice Attachments\\"
+os.makedirs(SAVE_DIR, exist_ok=True)  # Ensure the directory exists
+
+base_url = "https://openbravo.cloud/test_erp/org.openbravo.service.json.jsonrest"
+username = "Openbravo"
+password = "t3st"
+
+
+# sending email parameters
+sender_email = "accounts@com.solutions"
+receiver_email = "diana@com.solutions"
+smtp_server = "smtp-mail.outlook.com"
+smtp_port = 587
+smtp_user = "accounts@com.solutions"
+smtp_password = "test"
+
+hostname = "172.16.9.48"
+port = 4055
+server_username = "openbravo"
+server_password = "test"
+
+
+def extract_text_from_pdf(pdf_path):
+    text = ""
+    try:
+        with open(pdf_path, 'rb') as f:
+            pdf_reader = PdfReader(f)
+            for page in pdf_reader.pages:
+                text += page.extract_text() + "\n"
+        logging.debug(f"Text extracted from {pdf_path}")
+    except Exception as e:
+        logging.error(f"Failed to extract text from {pdf_path}: {e}")
+        return None
+    return text
+
+
+import os
+import logging
+
+def process_email(attachment):
+    # Extract file name and define the save path
+    file_name = attachment.FileName
+    file_path = os.path.join(SAVE_DIR, file_name)
+
+    # Attempt to save the attachment
+    try:
+        attachment.SaveAsFile(file_path)
+        logging.debug(f"Attachment saved: {file_name} at {file_path}")
+    except Exception as e:
+        logging.error(f"Failed to save attachment {file_name}: {e}")
+        return None, None, None  # Return None if saving fails
+
+    # Process PDF attachments
+    if file_path.lower().endswith('.pdf'):
+        text = extract_text_from_pdf(file_path)
+        if text:
+            logging.debug(f"Extracted text from {file_name}: {text[:100]}")  # Log first 100 characters of extracted text
+            return text, file_path, file_name
+        else:
+            logging.debug(f"No text found in the PDF: {file_name}")
+            return None, file_path, file_name  # Return None for text but include the file path
+    else:
+        logging.debug(f"Skipping non-PDF file: {file_name}")
+        return None, None, None  # Return None if the file is not a PDF
+
+def remove_colon(pdf_text):
+    clean_text = pdf_text.replace(":", "")
+    return clean_text
+
+def clean_invalid_json(json_str):
+    # Replace single quotes with double quotes
+    json_str = json_str.replace("'", '"')
+
+    # Ensure property names are enclosed in double quotes
+    json_str = re.sub(r'(?<!")(\b\w+\b)(?=\s*:)', r'"\1"', json_str)
+
+    # Remove any extraneous commas (trailing commas are not allowed in JSON)
+    json_str = re.sub(r',\s*([}\]])', r'\1', json_str)
+
+    # Remove any invalid escape sequences (anything not followed by valid escape characters)
+    json_str = re.sub(r'\\(?!["\\/bfnrt])', '', json_str)
+
+    # Handle improperly escaped backslashes (replace double backslashes with a single one)
+    json_str = re.sub(r'\\\\', r'\\', json_str)  # Replace double backslashes with a single one
+
+    # Remove any single backslashes not followed by valid escape characters
+    json_str = re.sub(r'\\(?!["\\/bfnrt])', '', json_str)
+
+    # Add missing commas between items (this will detect missing commas between line items in lists)
+    json_str = re.sub(r'(?<=\})(?=\s*{)', r',', json_str)
+
+    if json_str.count('[') != json_str.count(']'):
+        json_str += ']'
+
+        # Check for missing closing brackets (in case the JSON is incomplete)
+    if json_str.count('{') != json_str.count('}'):
+        json_str += '}'
+
+    # print(json_str)
+
+    return json_str
+
+
+def generate_structured_json(clean_text):
+    prompt = f"""
+        Extract key details from the following unstructured invoice text and present it as a structured JSON with keys like:
+        1. **invoiceId**: The unique identifier for the invoice.
+        2. **invoiceDate**: The date the invoice was issued.
+        3. **amountDue**: The total amount that needs to be paid.
+        4. **currency**: The currency in which the invoice is issued (e.g., USD, ZIG).
+        5. **customerName**: The name of the customer to whom the invoice is issued.
+        6. **vendorName**: The name of the vendor or company issuing the invoice(e.g., Telecontract).
+        7. **tax**: Any tax amount applied to the invoice.
+        8. **exciseDuty**: The excise duty amount, if applicable.
+        9. **USF**: The USF amount, if applicable.
+        10. **discount**: Any discount applied to the invoice.
+        11. **interestInArrears**: Any interest charges that are in arrears.
+        12. **amountBeforeVat**: The amount before VAT (if applicable).
+        13. **lineItems**: A detailed list of line items, where each line item includes:
+            - description: Description of the item/service.
+            - quantity: The measurable or countable amount of the item and it is a whole number and it is less than or equal to total price .
+            - unitPrice: The price per unit of the item.
+            - totalPrice: The total price for the line item.
+            - tax: The tax applied to the line item.
+
+        Text:
+    {clean_text}
+    """
+
+    model = genai.GenerativeModel("gemini-1.5-flash")
+    response = model.generate_content(prompt)
+    structured_text = response.text
+    match = re.search(r'\{.*\}', structured_text, re.DOTALL)
+    json_data = {}
+
+    if match:
+        json_str = match.group(0)
+        # Clean the JSON string before loading it
+        cleaned_json_str = clean_invalid_json(json_str)
+        try:
+            json_data = json.loads(cleaned_json_str)
+        except json.JSONDecodeError as e:
+            logging.error(f"Failed to parse JSON: {e}")
+
+    df_invoice = pd.DataFrame([json_data]) if isinstance(json_data, dict) else pd.DataFrame()
+    df_line_items = pd.DataFrame(json_data.get('lineItems', []))
+    #print(df_invoice)
+    #print(json_data)
+
+    return df_invoice, df_line_items, json_data
+
+
+def send_email(subject, body, attachment):
+    sender_email = "accounts@com.solutions"
+    msg_receiver_email = ['diana@com.solutions', 'eddie@com.solutions']
+    password = smtp_password
+    msg = MIMEMultipart()
+    msg['From'] = sender_email
+    msg['To'] = ','.join(msg_receiver_email)
+    msg['Subject'] = subject
+    msg.attach(MIMEText(body, 'plain'))
+    # Attach the file
+    part = MIMEBase('application', 'octet-stream')
+    part.set_payload(open(attachment, 'rb').read())
+    encoders.encode_base64(part)
+    part.add_header('Content-Disposition', f'attachment; filename={attachment}')
+    msg.attach(part)
+    try:
+        server = smtplib.SMTP('smtp.office365.com', 587)
+        server.starttls()
+        server.login(sender_email, password)
+        text = msg.as_string()
+        server.sendmail(sender_email, receiver_email, text)
+        server.quit()
+        #logging.info("Email notification sent successfully.")
+    except Exception as e:
+        logging.error(f"Error sending email: {e}")
+
+
+def handle_dataframes(df_invoice, df_line_items):
+    if not df_invoice.empty:
+        df_invoice.to_csv('invoice_data.csv', index=False)
+        forecast_file = "invoice_data.csv"
+        send_email("Extracted Invoice Header", "Please find the attached extracted invoice header.", forecast_file)
+        #logging.info("Invoice data saved to 'invoice_data.csv'.")
+
+    if not df_line_items.empty:
+        df_line_items.to_csv('line_items.csv', index=False)
+        forecast_file = "line_items.csv"
+        send_email("Extracted Invoice Lines", "Please find the attached extracted Invoice Lines.", forecast_file)
+        #logging.info("Line items saved to 'line_items.csv'.")
+
+
+def get_entity_id(entity, name, entity_field, base_url, username, password):
+    #logging.info(f"Function called for entity: {entity} with name: {name}")
+
+    # Construct the full API URL for the entity
+    api_url = f"{base_url}/{entity}"
+
+    try:
+        #logging.debug(f"Making API request to {entity}: {api_url}")
+        # Make the API request with basic authentication
+        response = requests.get(api_url, auth=HTTPBasicAuth(username, password))
+
+        # Log the response to inspect it
+        # logging.debug(f"API response: {response.json()}")
+
+        # Check if the request was successful (status code 200)
+        if response.status_code == 200:
+            # logging.info(f"API request to {entity} successful with status code: {response.status_code}")
+
+            # Parse the response content (assuming it's in JSON format)
+            entity_data = response.json()
+
+            # Check if the response has data and create DataFrame
+            if 'response' in entity_data and 'data' in entity_data['response']:
+                df_entity = pd.DataFrame(entity_data['response']['data'])
+                #logging.debug(f"{entity} DataFrame created from response")
+
+                # Search for the row where the name matches the given name (case-insensitive)
+                matching_row = df_entity[df_entity[entity_field] == name]
+
+                if not matching_row.empty and 'id' in matching_row.columns:
+                    entity_id = matching_row['id'].iloc[0]
+                    logging.info(f"Returning 'id' from matching row for {entity}: {entity_id}")
+                    return entity_id
+                else:
+                    logging.warning(f"No matching row found or 'id' column missing for {entity}.")
+                    return None
+            else:
+                logging.warning(f"No data found in the {entity} API response.")
+                return None
+        else:
+            logging.error(
+                f"{entity} API request failed with status code: {response.status_code}, message: {response.text}")
+            return None
+    except Exception as e:
+        logging.error(f"An error occurred during {entity} API request: {e}")
+        return None
+
+
+def fetch_default_ids(base_url, username, password):
+    """
+    Fetches default IDs for various entities using the get_entity_id function.
+    Returns:Default IDs as separate variables.
+    """
+    try:
+        # usage for fetching different IDs
+        default_currency_id = get_entity_id('Currency', 'USD', 'iSOCode', base_url, username, password)
+        #default_business_partner_id = get_entity_id('BusinessPartner', 'Invoice Automation', 'name', base_url, username,password)
+        default_business_partner_id = get_entity_id('BusinessPartner', 'Associated Meat Packers -  USD', 'name', base_url, username, password)
+        default_payment_terms_id = get_entity_id('FinancialMgmtPaymentTerm', '7 Days', 'name', base_url, username,
+                                                 password)
+        default_price_list_id = get_entity_id('PricingPriceList', 'Syntegra Purchase Price List - USD', 'name',
+                                              base_url, username, password)
+        default_partnerAddress_id = get_entity_id('BusinessPartnerLocation', '1-3 Coventry Road , Workington , Harare , Zimbabwe', 'name', base_url, username,password)
+        #default_partnerAddress_id = get_entity_id('BusinessPartnerLocation', '.Harare, Block 6, Arundel Office Park', 'name', base_url, username, password)
+        #default_product_id = get_entity_id('Product', 'Default Product', 'name', base_url, username, password)
+        default_product_id = get_entity_id('Product', 'AI / Machine Learning', 'name', base_url, username, password)
+        default_uOM = get_entity_id('UOM', 'Unit', 'name', base_url, username, password)
+        default_taxCategory = get_entity_id('FinancialMgmtTaxRate', 'Standard rated 15%', 'name', base_url, username,
+                                            password)
+        default_warehouse_id = get_entity_id('Warehouse', 'Syntegra Solutions Warehouse', 'name', base_url, username,
+                                             password)
+        documentType = get_entity_id('DocumentType', 'Purchase Order - Syntegra Solutions', 'name', base_url, username,
+                                     password)
+        tax_exempt = get_entity_id('FinancialMgmtTaxRate', 'Exempt', 'name', base_url, username, password)
+        # default_account = get_entity_id('FinancialMgmtGLItem', '42000290-Rent', 'name', base_url, username, password)
+        # invoice_doc_type = get_entity_id('DocumentType', 'AP Invoice - Syntegra Solutions', 'name', base_url, username, password)
+        default_Costcenter = get_entity_id('Costcenter', 'Managed Services', 'name', base_url, username, password)
+
+        # Return all IDs separately
+        return default_currency_id, default_business_partner_id, default_payment_terms_id, default_price_list_id, default_partnerAddress_id, default_product_id, default_uOM, default_taxCategory, default_warehouse_id, documentType, tax_exempt, default_Costcenter
+
+    except Exception as e:
+        print(f"An error occurred: {e}")
+        return None
+
+# Fetch IDs
+
+def check_customer(df_invoice):
+    # Initialize the result variable
+    result = None
+
+    # Iterate over each row of the DataFrame
+    for _, row in df_invoice.iterrows():
+        customer_name = row['customerName']
+
+        # Check for 'Syntegra Solutions' or 'My Cash' in a case-insensitive way
+        if pd.Series(customer_name).str.contains('Syntegra Solutions', case=False, na=False).any():
+            result = 'Syntegra Solutions'
+            logging.info(f"Found match: {result} in customer: {customer_name}")
+            break  # Stop as soon as the first match is found
+        elif pd.Series(customer_name).str.contains('My Cash', case=False, na=False).any():
+            result = 'My Cash'
+            logging.info(f"Found match: {result} in customer: {customer_name}")
+            break  # Stop as soon as the first match is found
+
+    # If no match was found, log and return None
+    if result is None:
+        result = 'Syntegra Solutions'
+        logging.info("No matching customer found.")
+
+    return result
+
+# Example usage:
+# df_invoice = pd.DataFrame({'customer': ['Syntegra Solutions', 'Other Customer', 'My Cash']})
+# result = check_customer(df_invoice)
+# print(result)
+
+def get_org_df(result):
+    org = result #"Syntegra Solutions"
+    #logging.info(f"Function called with organization: {org}")
+
+    # Define the entity
+    entity = 'Organization'
+
+    # Construct the full API URL by combining the base URL with the entity
+    api_url = f"{base_url}/{entity}"
+
+    try:
+        #logging.debug(f"Making API request to Organization: {api_url}")
+        # Make the API request with basic authentication
+        response = requests.get(api_url, auth=HTTPBasicAuth(username, password))
+
+        # Check if the request was successful (status code 200)
+        if response.status_code == 200:
+            # logging.info(f"API request to org successful with status code: {response.status_code}")
+
+            # Parse the response content (assuming it's in JSON format)
+            org_data = response.json()
+            # logging.debug(f"API response received: {org_data}")
+
+            # Check if the response has data and create DataFrame
+            if 'response' in org_data and 'data' in org_data['response']:
+                df_Org = pd.DataFrame(org_data['response']['data'])
+                # logging.debug(f"org DataFrame created from response: {df_Org}")
+
+                # Search for the row where businessPartner matches result_id
+                matching_row = df_Org[df_Org['name'] == org]
+
+                if not matching_row.empty and 'id' in matching_row.columns:
+                    org_id = matching_row['id'].iloc[0]
+                    logging.info(f"Returning 'org_id' from matching row: {org_id}")
+                    return org_id
+                else:
+                    logging.warning("No matching row found or 'org_id' column missing.")
+                    return None
+            else:
+                logging.warning("No data found in the org API response.")
+                return None
+        else:
+            logging.error(f"org API request failed with status code: {response.status_code}, message: {response.text}")
+            return None
+    except Exception as e:
+        logging.error(f"An error occurred during org API request: {e}")
+        return None
+
+
+# org = get_org_df()
+# print(org)
+
+def get_businessPartner_data_df(org_id):
+    # Define the entity
+    entity = 'BusinessPartner'
+
+    # Construct the full API URL by combining the base URL with the entity
+    api_url = f"{base_url}/{entity}"
+
+    try:
+        # Make the API request with basic authentication
+        response = requests.get(api_url, auth=HTTPBasicAuth(username, password))
+
+        # Check if the request was successful (status code 200)
+        if response.status_code == 200:
+            # Parse the response content (assuming it's in JSON format)
+            businessPartner_data = response.json()
+            # Process the project data as needed
+            # print("Project data retrieved successfully:")
+            # print(businessPartner_data)
+        else:
+            print(f"Error: {response.status_code} - {response.text}")
+    except Exception as e:
+        print(f"An error occurred: {e}")
+    df_businessPartner = pd.DataFrame(businessPartner_data['response']['data'])
+    # Filter DataFrame to include only rows where 'organisation' matches org
+    df_businessPartner = df_businessPartner[df_businessPartner['organization'] == org_id]
+    return df_businessPartner
+
+
+# df_businessPartner = get_businessPartner_data_df()
+# df_businessPartner
+
+def extract_first_word(text):
+    try:
+        return text.split('[')[1].split(']')[0].lower()
+    except IndexError:
+        return None
+
+def merge_dataframes(df_invoice, df_businessPartner):
+    """
+    Merges the df_invoice and df_businessPartner DataFrames based on a partner column derived from the vendorName.
+    """
+
+    # Ensure 'partner' column is created correctly in df_invoice by extracting the first word from 'vendorName'
+    df_invoice['partner'] = df_invoice['vendorName'].apply(lambda x: str(x).split()[0].lower().replace('-', '') if pd.notna(x) else None)
+
+    # Ensure 'partner' column is created correctly in df_businessPartner by extracting the first word from 'name'
+    df_businessPartner['partner'] = df_businessPartner['name'].apply(
+        lambda x: str(x).split()[0].lower() if pd.notna(x) else None)
+
+    # Perform the merge on the 'partner' column
+    merged_df = pd.merge(df_invoice, df_businessPartner, how='left', on='partner')
+
+    # Optionally, fill missing values (NaNs) in business partner columns if no match is found
+    merged_df.fillna('', inplace=True)
+
+    # Log or print the rows where no match was found (optional)
+    unmatched_rows = merged_df[merged_df['name'] == '']
+    if not unmatched_rows.empty:
+        logging.warning(f"Unmatched rows in df_invoice: {unmatched_rows}")
+
+    return merged_df
+
+# merged_df = merge_dataframes(df_invoice, df_businessPartner)
+
+def get_id_from_merged_dataframe(merged_df, org_id,default_business_partner_id):
+    """
+    Extract the ID based on specific conditions from a merged DataFrame.
+    """
+    if merged_df.empty:
+        logging.info("The merged DataFrame is empty.")
+        return default_business_partner_id
+
+    # Standardize 'currency_x' to treat variations of 'zig' as 'ZWG'
+    merged_df['currency_x'] = merged_df['currency_x'].str.lower().replace(r'zig', 'zwg', regex=True)
+
+    if len(merged_df) == 1:
+        # logging.info("The bp merged DataFrame contains exactly one row.")
+        return merged_df['id'].iloc[0]
+
+    elif len(merged_df) > 1:
+        # logging.info("The merged bp DataFrame contains more than one row. Searching for matching currency rows.")
+        # Filter rows where both currency_x equals currency$_identifier and organization equals the given org
+        matching_rows = merged_df[
+            (merged_df['currency_x'].str.lower() == merged_df['currency$_identifier'].str.lower()) &
+            (merged_df['organization'].str.lower() == org_id.lower())
+            ]
+        if not matching_rows.empty:
+            logging.info("Found rows where currency_x matches currency$_identifier. Returning the first match.")
+            return matching_rows['id'].dropna().iloc[0]
+        else:
+            logging.warning("No matching rows found where currency_x equals currency$_identifier.")
+            return merged_df['id'].iloc[0]  # Return the first row if no match is found
+
+    else:
+        logging.error("Unexpected data situation: bp merged_df has fewer rows than expected.")
+        return None
+
+
+def get_dataframe_from_merged_dataframe(merged_df, org_id):
+    """
+    Extract a DataFrame with at most one row based on specific conditions from a merged DataFrame.
+    """
+    if merged_df.empty:
+        logging.info("The bp merged DataFrame is empty.")
+        return pd.DataFrame()
+
+    # Standardize 'currency_x' to treat variations of 'zig' as 'ZWG'
+    merged_df['currency_x'] = merged_df['currency_x'].str.lower().replace(r'zig', 'zwg', regex=True)
+
+    if len(merged_df) == 1:
+        logging.info("The bp merged DataFrame contains exactly one row.")
+        return merged_df
+
+    elif len(merged_df) > 1:
+        logging.info("The bp merged DataFrame contains more than one row. Searching for matching currency rows.")
+        # Filter rows where both currency_x equals currency$_identifier and organization equals the given org
+        matching_rows = merged_df[
+            (merged_df['currency_x'].str.lower() == merged_df['currency$_identifier'].str.lower()) &
+            (merged_df['organization'] == org_id)
+            ]
+        if not matching_rows.empty:
+            logging.info("Found rows where currency_x matches currency$_identifier. Returning the first match.")
+            return matching_rows.head(1)
+        else:
+            logging.warning("No matching rows found where currency_x equals currency$_identifier.")
+            return merged_df.head(1)  # Return the first row if no match is found
+
+    else:
+        logging.error("Unexpected data situation: merged_df has fewer rows than expected.")
+        return pd.DataFrame()
+
+
+# validated_matched_df = get_dataframe_from_merged_dataframe(merged_df)
+
+def order_exist_df(validated_matched_df):
+    for index, row in validated_matched_df.iterrows():
+        invoice_id = row.get('invoiceId', '')[:30]
+        # Define the API endpoint
+        api_url = f"https://openbravo.cloud/test_erp/org.openbravo.service.json.jsonrest/Order?_where=orderReference='{invoice_id}'"
+        #api_url = f"https://innscor.predictiv.cloud/erp/org.openbravo.service.json.jsonrest/Order?_where=orderReference='{invoice_id}'"
+
+        try:
+            # Log the constructed API URL
+            logging.info(f"Making API request to URL: {api_url}")
+            # Make the GET request with basic authentication
+            response = requests.get(api_url, auth=HTTPBasicAuth(username, password))
+
+            # Check if the request was successful
+            if response.status_code == 200:
+                logging.info(f"API request successful with status code: {response.status_code}")
+                # Parse the JSON response
+                bplocation_data = response.json()
+                print(bplocation_data)
+
+                # Check if the JSON response is empty
+                if not bplocation_data:  # Handles both empty lists and dictionaries
+                    logging.warning("API response is empty. Returning an empty DataFrame.")
+                    return pd.DataFrame()
+
+                    # Check if the response has data and create DataFrame
+                if 'response' in bplocation_data and 'data' in bplocation_data['response']:
+                    df_OrderExists = pd.DataFrame(bplocation_data['response']['data'])
+                    logging.debug(f" df_OrderExists DataFrame created from response")
+
+                return df_OrderExists
+            else:
+                # Log the error and raise an exception for failed requests
+                logging.error(f"API request failed with status code: {response.status_code}")
+                logging.error(f"Response: {response.text}")
+                return pd.DataFrame()  # Return an empty DataFrame if the request fails
+
+        except requests.exceptions.RequestException as e:
+            # Log and return an empty DataFrame if an exception occurs
+            logging.exception("An error occurred while making the API request")
+            return pd.DataFrame()
+
+def check_order_existence(df_OrderExist, bp_id, default_business_partner_id):
+    if bp_id is None:
+        bp_id = default_business_partner_id
+
+    if df_OrderExist.empty:
+        return False
+
+    # Check if any 'businessPartner' matches the given bp_id
+    if (df_OrderExist['businessPartner'] == bp_id).any():
+        return True
+
+    return False
+
+
+def get_BPLocation_df(bp_id,default_business_partner_id, default_partnerAddress_id):
+    if bp_id is None:
+        bp_id = default_business_partner_id
+    # Fetch Business Partner Location data from the Openbravo API and return the id
+
+    #logging.info(f"Function called with bp_id: {bp_id}")
+
+    # Define the entity
+    entity = 'BusinessPartnerLocation'
+
+    # Construct the full API URL by combining the base URL with the entity
+    api_url = f"{base_url}/{entity}"
+
+    try:
+        #logging.debug(f"Making API request to URL: {api_url}")
+        # Make the API request with basic authentication
+        response = requests.get(api_url, auth=HTTPBasicAuth(username, password))
+
+        # Check if the request was successful (status code 200)
+        if response.status_code == 200:
+            #logging.info(f"API request successful with status code: {response.status_code}")
+
+            # Parse the response content (assuming it's in JSON format)
+            bplocation_data = response.json()
+            # logging.debug(f"API response received: {bplocation_data}")
+
+            # Check if the response has data and create DataFrame
+            if 'response' in bplocation_data and 'data' in bplocation_data['response']:
+                df_BPLocation = pd.DataFrame(bplocation_data['response']['data'])
+                logging.debug(f" bplocation DataFrame created from response")
+
+                # Search for the row where businessPartner matches result_id
+                matching_row = df_BPLocation[df_BPLocation['businessPartner'] == bp_id]
+
+                if not matching_row.empty and 'id' in matching_row.columns:
+                    bPLocation_id = matching_row['id'].iloc[0]
+                    logging.info(f"Returning 'bplocation_id' from matching row: {bPLocation_id}")
+                    return bPLocation_id
+                else:
+                    logging.warning("No matching row found or 'bplocation_id' column missing.")
+                    return default_partnerAddress_id
+            else:
+                logging.warning("No data found in the bplocation API response.")
+                return default_partnerAddress_id
+        else:
+            logging.error(
+                f"bplocation API request failed with status code: {response.status_code}, message: {response.text}")
+            return None
+    except Exception as e:
+        logging.error(f"An error occurred during bplocation API request: {e}")
+        return None
+
+
+import locale
+def parse_invoice_date(date_str):
+    """
+    Attempt to parse the invoice date from multiple formats and return it as a datetime object.
+    """
+
+    date_str = date_str.strip().replace("\xa0", " ")
+    # locale.setlocale(locale.LC_TIME, "en_US.UTF-8")
+
+    # List of potential date formats
+    date_formats = [
+        '%d/%m/%y',  # Format like '01/04/24'
+        '%d/%m/%Y',  # Format like '01/04/2024'
+        '%m/%d/%Y',  # Format like '04/01/2024' (US style)
+        '%Y-%m-%d',  # Format like '2024-04-01'
+        '%d %b %Y',  # Format like '01 Nov 2024'
+        '%d %b %y',  # Format like '01 Nov 24' (2-digit year)
+        '%d-%b-%Y',  # Format like '01-Nov-2024'
+        '%d-%b-%y',  # Format like '01-Nov-24'
+        '%b %d, %Y',  # Format like 'Nov 01, 2024'
+        '%b %d, %y',  # Format like 'Nov 01, 24'
+        '%d/%m/%y',  # Example: '01/04/24'
+        '%d/%m/%Y',  # Example: '01/04/2024'
+        '%m/%d/%y',  # Example: '04/01/24'
+        '%m/%d/%Y',  # Example: '04/01/2024'
+        '%Y-%m-%d',  # Example: '2024-04-01' (ISO)
+        '%d-%m-%Y',  # Example: '01-04-2024'
+        '%d-%m-%y',  # Example: '01-04-24'
+        '%d %b %Y',  # Example: '01 Nov 2024'
+        '%d %b %y',  # Example: '01 Nov 24'
+        '%d-%b-%Y',  # Example: '01-Nov-2024'
+        '%d-%b-%y',  # Example: '01-Nov-24'
+        '%b %d, %Y',  # Example: 'Nov 01, 2024'
+        '%b %d, %y',  # Example: 'Nov 01, 24'
+        '%d %B %Y',  # Example: '01 November 2024'
+        '%d %B %y',  # Example: '01 November 24'
+        '%B %d, %Y',  # Example: 'November 01, 2024'
+        '%B %d, %y',  # Example: 'November 01, 24'
+        '%Y.%m.%d',  # Example: '2024.04.01'
+        '%m.%d.%Y',  # Example: '04.01.2024'
+        '%d.%m.%Y',  # Example: '01.04.2024'
+        '%d.%m.%y',  # Example: '01.04.24'
+        '%Y/%m/%d',  # Example: '2024/04/01'
+        '%d/%b/%Y',  # Example: '01/Nov/2024'
+        '%d/%b/%y',  # Example: '01/Nov/24'
+        '%b/%d/%Y',  # Example: 'Nov/01/2024'
+        '%b/%d/%y'  # Example: 'Nov/01/24'
+    ]
+
+    # Try to parse the date using the formats
+    for fmt in date_formats:
+        try:
+            date_obj = datetime.strptime(date_str, fmt)  # Parse to datetime object
+            return date_obj.strftime('%Y-%m-%d')  # Return as a datetime object
+
+        except ValueError:
+            logging.debug(f"Failed format: '{fmt}' for date: '{date_str}'")
+            continue
+
+    # If parsing fails, return the current date and log a warning
+    current_date = datetime.now().strftime('%Y-%m-%d')
+    logging.warning(f"Failed to convert invoiceDate: '{date_str}'. Returning current date: {current_date}")
+    return current_date
+
+
+def post_order_to_erp_and_get_invoice_id_validated(validated_matched_df, bPLocation_id, org_id, default_currency_id, default_business_partner_id, default_payment_terms_id, default_price_list_id,default_partnerAddress_id,default_warehouse_id, documentType):
+    """
+    Post invoices to ERP system and return the ID of the first created invoice.
+    """
+    #logging.debug("Posting header to Predictiv...")
+    # Define the entity
+    #entity = 'Order'
+
+    # Construct the full API URL by combining the base URL with the entity
+    api_url = base_url
+
+    partnerAddress = bPLocation_id
+
+    for index, row in validated_matched_df.iterrows():
+        vendor_name = row.get('vendorName')
+        grandTotalAmount = row.get('amountDue')
+        invoiceDate = row.get('invoiceDate')
+        orderReference = row.get('invoiceId', '')[:30]
+
+        # Default values passed as parameters
+        currency = row.get('currency_y') or default_currency_id  # Default currency ID
+        businessPartner = row.get('id') or default_business_partner_id  # Default businessPartner ID
+        #businessPartner = row.get('id') if row.get('id') is not None else default_business_partner_id
+        paymentTerms = row.get('pOPaymentTerms') or default_payment_terms_id  # Default payment terms ID
+        priceList = row.get('purchasePricelist') or default_price_list_id  # Default price list ID
+        partnerAddress = bPLocation_id or default_partnerAddress_id  # Default partner address
+        if businessPartner is None:
+            businessPartner = default_business_partner_id
+        try:
+            grandTotalAmount = float(
+                str(grandTotalAmount).replace(',', ''))  # Convert to float if decimal conversion fails
+        except ValueError as e:
+            logging.error(f"Failed to convert grandTotalAmount for invoice {orderReference}: {e}")
+            continue  # Skip this invoice if both conversions fail
+
+        # Convert date to ISO 8601 (YYYY-MM-DD) using the new parsing function
+        invoiceDate_iso = parse_invoice_date(invoiceDate)
+        if not invoiceDate_iso:
+            logging.error(f"Skipping invoice {orderReference} due to invalid date format: {invoiceDate}")
+            continue  # Skip this invoice if date conversion fails
+
+        # Skip rows where orderReference or other critical fields are missing
+        if pd.notna(orderReference) and pd.notna(vendor_name) and pd.notna(grandTotalAmount):
+            payload = {
+                "data": [
+                    {
+                        "_entityName": "Order",
+                        "organization": org_id,
+                        "active": "true",
+                        "currency": currency,
+                        "businessPartner": businessPartner,
+                        "salesTransaction": False,
+                        "documentType": documentType,
+                        "transactionDocument": documentType,
+                        "orderReference":orderReference,
+                        "orderDate": invoiceDate_iso,  # Use ISO 8601 formatted date
+                        "accountingDate": invoiceDate_iso,
+                        "scheduledDeliveryDate": invoiceDate_iso,
+                        "partnerAddress": partnerAddress,
+                        "paymentTerms": paymentTerms,
+                        "warehouse": default_warehouse_id,
+                        "grandTotalAmount": grandTotalAmount,
+                        "priceList": priceList
+                    }
+                ]
+            }
+
+            logging.info(f"Payload being sent for {vendor_name}: {payload}")
+            try:
+                response = requests.post(
+                    api_url,
+                    json=payload,
+                    auth=(username, password)
+                )
+                response.raise_for_status()  # Raise an exception for non-200 status codes
+                response_data = response.json()  # Parse the JSON response
+
+                #logging.info(f"Response content: {response_data}")
+
+                # Check if response contains the created invoice ID
+                if response_data.get("response", {}).get("status") == 0:  # Success status check
+                    created_order_id_validated = response_data.get("response", {}).get("data", [{}])[0].get("id")
+                    created_order_date_validated = response_data.get("response", {}).get("data", [{}])[0].get(
+                        "orderDate")
+                    currency_validated = response_data.get("response", {}).get("data", [{}])[0].get("currency")
+                    bp_validated = response_data.get("response", {}).get("data", [{}])[0].get("businessPartner")
+                    logging.info(f"Invoice {index + 1} created successfully: ID {created_order_id_validated}")
+                    print(
+                        f"Invoice {index + 1} created successfully: ID {created_order_id_validated}, Order Date {created_order_date_validated}")
+                    return created_order_id_validated, created_order_date_validated, currency_validated, bp_validated  # Return the first created invoice ID and order date
+
+                else:
+                    logging.error(f"Failed to create order header {index + 1}: {response_data}")
+                    print(f"Failed to order header {index + 1}: {response_data}")
+
+            except requests.exceptions.RequestException as e:
+                logging.error(f"Error posting record {index + 1} for {vendor_name}: {e}")
+                print(f"Error posting record {index + 1} for {vendor_name}: {e}")
+        else:
+            logging.warning(f"Skipping row {index + 1} due to missing key data: {vendor_name}, {orderReference}")
+            print(f"Skipping row {index + 1} due to missing key data: {vendor_name}, {orderReference}")
+
+    return None  # Return None if no invoice ID is created
+
+
+# created_invoice_id_validated, created_order_date_validated, currency_validated, bp_validated = post_order_to_erp_and_get_invoice_id_validated(validated_matched_df, bPLocation_id, org)
+# print(created_invoice_id_validated, created_order_date_validated, currency_validated, bp_validated)
+
+def get_Product_data_df(org_id):
+    # Define the entity
+    entity = 'Product'
+    # Construct the full API URL by combining the base URL with the entity
+    api_url = f"{base_url}/{entity}"
+    try:
+        # Make the API request
+        response = requests.get(
+            api_url,
+            auth=(username, password)
+        )
+        response.raise_for_status()  # Raise an exception for HTTP errors
+
+        # Parse the JSON response
+        product_data = response.json()
+
+        # Extract data and create DataFrame
+        df_Product = pd.DataFrame(product_data['response']['data'])
+
+        # Filter DataFrame to include only rows where 'organisation' matches org
+        df_Product = df_Product[df_Product['organization'] == org_id]
+
+        return df_Product
+
+    except requests.exceptions.RequestException as e:
+        print(f"Request error: {e}")
+    except KeyError as e:
+        print(f"Key error: {e}")
+    except ValueError as e:
+        print(f"Value error: {e}")
+    except Exception as e:
+        print(f"An unexpected error occurred: {e}")
+
+    # Return an empty DataFrame if an error occurs
+    return pd.DataFrame()
+
+def get_VendorProduct_data_df(org_id):
+    # Define the entity
+    entity = 'ApprovedVendor'
+    # Construct the full API URL by combining the base URL with the entity
+    api_url = f"{base_url}/{entity}"
+    try:
+        # Make the API request
+        response = requests.get(
+            api_url,
+            auth=(username, password)
+        )
+        response.raise_for_status()  # Raise an exception for HTTP errors
+
+        # Parse the JSON response
+        vendor_product_data = response.json()
+
+        # Extract data and create DataFrame
+        df_VendorProduct = pd.DataFrame(vendor_product_data['response']['data'])
+
+        # Filter DataFrame to include only rows where 'organisation' matches org
+        df_VendorProduct = df_VendorProduct[df_VendorProduct['organization'] == org_id]
+
+        return df_VendorProduct
+    except requests.exceptions.RequestException as e:
+        print(f"Request error: {e}")
+    except KeyError as e:
+        print(f"Key error: {e}")
+    except ValueError as e:
+        print(f"Value error: {e}")
+    except Exception as e:
+        print(f"An unexpected error occurred: {e}")
+
+    # Return an empty DataFrame if an error occurs
+    return pd.DataFrame()
+
+
+def merge_line_items_with_products(df_line_items, df_VendorProduct, df_Product, bp_validated, default_product_id):
+    """
+    Merges rows from df_line_items with df_Product based on matching logic, case-insensitively.
+    """
+    #logging.info("Starting merge_line_items_with_products function.")
+
+    # Ensure description column is clean
+    df_line_items['description'] = df_line_items['description'].fillna('').astype(str)
+    df_VendorProduct['predpaVenProdName'] = df_VendorProduct['predpaVenProdName'].fillna('').astype(str)
+    logging.debug(f"Cleaned 'description' and 'predpaVenProdName' columns.")
+
+    merged_data = []
+
+    for _, line_item in df_line_items.iterrows():
+        # Debugging: Log raw and processed description
+        #logging.debug(f"Processing line_item: {line_item.to_dict()}")
+        description = line_item['description'].lower()
+        #logging.debug(f"Processed description: {description}")
+
+        matched = False
+
+        # Check for matching vendor product name in description
+        for _, vendor_product in df_VendorProduct.iterrows():
+            vendor_product_name = vendor_product['predpaVenProdName'].lower()  # Convert to lowercase
+            if vendor_product_name in description:
+                logging.info(f"Match found: Vendor product '{vendor_product_name}' in description : {description}.")
+                product_id = vendor_product['product']
+
+                # Check if product exists in df_Product
+                product_row = df_Product[df_Product['id'] == product_id]
+
+                if not product_row.empty and vendor_product['businessPartner'] == bp_validated:
+                    logging.info(f"Product ID {product_id} matched and validated.")
+                    merged_row = {**line_item.to_dict(), **product_row.iloc[0].to_dict()}
+                    merged_data.append(merged_row)
+                    matched = True
+                    break
+
+        # Use default product if no match is found
+        if not matched:
+            logging.warning(f"No match found for line_item. Using default product ID: {default_product_id}")
+            default_product_row = df_Product[df_Product['id'] == default_product_id]
+            if not default_product_row.empty:
+                merged_row = {**line_item.to_dict(), **default_product_row.iloc[0].to_dict()}
+                merged_data.append(merged_row)
+
+    # Convert the merged data back to a DataFrame
+    product_merged_df = pd.DataFrame(merged_data)
+    logging.info("Merging complete. Returning merged DataFrame.")
+    return product_merged_df
+
+
+def get_tax_df(product_merged_df):
+    """Fetch tax data from the Openbravo API
+    """
+    # if window == 'order':
+    taxCategory = product_merged_df['taxCategory'].iloc[0] if not product_merged_df['taxCategory'].empty else None
+    # else:
+    # taxCategory = gl_merged_df['taxCategory'].iloc[0] if not gl_merged_df['taxCategory'].empty else None
+
+    if taxCategory is None:
+        logging.warning("No tax category found.")
+        return None
+    # logging.info(f"Function called with taxCategory: {taxCategory}")
+    # Define the entity
+    entity = 'FinancialMgmtTaxRate'
+    # Construct the full API URL by combining the base URL with the entity
+    api_url = f"{base_url}/{entity}"
+    try:
+        #logging.debug(f"Making API request to URL: {api_url}")
+        # Make the API request with basic authentication
+        response = requests.get(api_url, auth=HTTPBasicAuth(username, password))
+        # Check if the request was successful (status code 200)
+        if response.status_code == 200:
+            #       logging.info(f" tax API request successful with status code: {response.status_code}")
+            # Parse the response content (assuming it's in JSON format)
+            tax_data = response.json()
+            # logging.debug(f"API response received: {bplocation_data}")
+            # Check if the response has data and create DataFrame
+            if 'response' in tax_data and 'data' in tax_data['response']:
+                df_Tax = pd.DataFrame(tax_data['response']['data'])
+                # logging.debug(f"tax DataFrame created from response: {df_Tax}")
+
+                # Search for the row where businessPartner matches result_id
+                matching_row = df_Tax[df_Tax['taxCategory'] == taxCategory]
+
+                if not matching_row.empty and 'id' in matching_row.columns:
+                    tax_id = matching_row['id'].iloc[0]
+                    logging.info(f"Returning 'tax_id' from matching row: {tax_id}")
+                    return tax_id
+                else:
+                    logging.warning("No matching row found or 'id' column missing.")
+                    return None
+            else:
+                logging.warning("No data found in the API response.")
+                return None
+        else:
+            logging.error(f"tax API request failed with status code: {response.status_code}, message: {response.text}")
+            return None
+    except Exception as e:
+        logging.error(f"An error occurred during tax API request: {e}")
+        return None
+
+
+# tax= get_tax_df(taxCategory)
+# print(tax)
+
+def clean_quantity(value):
+    # Extract numeric part using regex
+    numeric_part = re.findall(r'\d+\.?\d*', str(value))
+    if numeric_part:
+        return float(numeric_part[0])  # Convert to float if numeric part exists
+    return 1.0  # Default to 1.0 for non-numeric or invalid values
+
+
+# In[14]:
+
+def calculate_expense_per_line(df_invoice, product_merged_df):
+    # Select appropriate DataFrame based on window type
+    new_df = product_merged_df  # if window == 'order' else gl_merged_df
+    # Initialize the expense to 0
+    total_expense = 0.0
+    #logging.info("Starting expense calculation.")
+
+    # Check if 'usf' and 'exciseDuty' are present in df_invoice and not None
+    if df_invoice.get('usf') is not None:
+        # Convert 'usf' to float and use 0 if it's None
+        usf_value = float(df_invoice['usf'].fillna(0).values[0])
+        total_expense += usf_value
+        logging.info(f"USF Value: {usf_value:.2f}")
+
+    if df_invoice.get('exciseDuty') is not None:
+        # Convert 'exciseDuty' to float and use 0 if it's None
+        excise_duty_value = float(df_invoice['exciseDuty'].fillna(0).values[0])
+        total_expense += excise_duty_value
+        logging.info(f"Excise Duty Value: {excise_duty_value:.2f}")
+
+    new_df['quantity'] = new_df['quantity'].apply(clean_quantity)
+    new_df.loc[new_df['quantity'] % 1 != 0, 'quantity'] = 1.0
+
+    # Sum the quantity from df_line_items
+    total_quantity = float(new_df['quantity'].astype(float).sum())
+    logging.info(f"Total Quantity: {total_quantity:.2f}")
+
+    # Calculate expense per line by dividing total expense by the sum of quantities
+    if total_quantity > 0:
+        expense_per_line = total_expense / total_quantity
+        logging.info(f"Expense per line: {expense_per_line:.2f}")
+    else:
+        expense_per_line = 0.0  # Avoid division by zero if no quantity exists
+        logging.warning("Total quantity is zero; expense per line is set to 0.0")
+
+    # Return the expense per line as a float
+    return float(expense_per_line)
+
+
+def post_order_to_erp_lines(product_merged_df,default_warehouse_id, default_product_id,default_uOM, created_order_date_validated,default_taxCategory, created_order_id_validated,
+                            currency_validated, bp_validated, org_id, expense_per_line):
+    """
+    Post line items to ERP for a single invoice.
+    """
+    #logging.debug("Posting line items to ERP system...")
+    # Define the entity
+    entity = 'OrderLine'
+
+    # Construct the full API URL by combining the base URL with the entity
+    api_url = f"{base_url}/{entity}"
+    if not isinstance(product_merged_df, pd.DataFrame):
+        logging.error(f"Expected DataFrame, but got {type(product_merged_df)} instead.")
+        return
+
+    if product_merged_df.empty:
+        logging.error("product_merged_df is empty. Cannot post to ERP.")
+        return
+
+    for index, row in product_merged_df.iterrows():
+        description = row.get('description')
+        quantity = row.get('quantity')
+        unitPrice = row.get('unitPrice')
+        totalPrice = row.get('totalPrice')
+        product_id = row.get('id') if row.get('id') is not None else default_product_id
+        uOM = row.get('uOM') if row.get('uOM') is not None else default_uOM
+
+        tax = get_tax_df(product_merged_df) or default_taxCategory
+
+        # Log the original values for debugging purposes
+        logging.debug(
+            f"Original values - Description: {description}, Quantity: {quantity}, Unit Price: {unitPrice}, Total Price: {totalPrice}")
+        # Set quantity to 1 if it is None or 0
+        if quantity is None or quantity == 0:
+            quantity = 1.0
+        else:
+            try:
+                # Remove non-numeric characters except digits, commas, periods, and hyphens, then convert to float
+                quantity = float(re.sub(r'[^\d.,-]', '', str(quantity)).replace(',', ''))
+            except ValueError as e:
+                logging.error(f"Failed to convert quantity for line item {index + 1}: {e}")
+                quantity = 1.0  # Default to 1 if conversion fails
+                # if quantity % 1 != 0 or (isinstance(quantity, float) and quantity != int(quantity)):
+                # quantity = 1.0
+        # Convert quantity, unitPrice, and totalPrice to float
+        try:
+            # Remove non-numeric characters except digits, commas, periods, and hyphens, then convert to float
+            if quantity is not None and str(quantity).strip() != '':
+                quantity = float(re.sub(r'[^\d.,-]', '', str(quantity)).replace(',', ''))
+            else:
+                quantity = 1.0  # Set default quantity to 0 if None
+
+            if unitPrice is not None and str(unitPrice).strip() != '':
+                unitPrice = float(re.sub(r'[^\d.,-]', '', str(unitPrice)).replace(',', ''))
+            else:
+                raise ValueError(f"Invalid unitPrice for line {index + 1}: {unitPrice}")
+
+            if totalPrice is not None and str(totalPrice).strip() != '':
+                totalPrice = float(re.sub(r'[^\d.,-]', '', str(totalPrice)).replace(',', ''))
+            else:
+                raise ValueError(f"Invalid totalPrice for line {index + 1}: {totalPrice}")
+
+        except ValueError as e:
+            logging.error(
+                f"Failed to convert values for line item {index + 1}: {e} - Quantity: {quantity}, Unit Price: {unitPrice}, Total Price: {totalPrice}")
+            continue  # Skip this line item if conversion fails
+
+        if quantity % 1 != 0 or (isinstance(quantity, float) and quantity != int(quantity)):
+            quantity = 1.0
+
+        validated_Unit_Price = unitPrice + expense_per_line
+        # Prepare the payload
+        if pd.notna(unitPrice):
+            payload = {
+                "data": [
+                    {
+                        "_entityName": "OrderLine",
+                        "organization": org_id,
+                        "active": "true",
+                        "lineNetAmount": totalPrice,
+                        "description": description,
+                        "salesOrder": created_order_id_validated,  # Use the single oder ID passed to this function
+                        "listPrice": validated_Unit_Price,
+                        "unitPrice": validated_Unit_Price,
+                        "orderedQuantity": quantity,
+                        "uOM": uOM,  # unit of measure ID
+                        "currency": currency_validated,
+                        "tax": tax,  # Assuming this is a valid tax ID
+                        "lineNo": (index + 1) * 10,  # Line number, incremented by 10 for each item
+                        "businessPartner": bp_validated,
+                        "warehouse": default_warehouse_id,
+                        "product": product_id,
+                        "orderDate": created_order_date_validated
+
+                    }
+                ]
+            }
+
+            logging.info(f"Payload being sent for line {index + 1}: {payload}")
+            try:
+                response = requests.post(
+                    api_url,
+                    json=payload,
+                    auth=(username, password)
+                )
+                response_data = response.json()  # Parse the JSON response
+                logging.info(f"Response content: {response_data}")
+
+                response.raise_for_status()  # Raise an exception for non-200 status codes
+
+                if response_data.get("response", {}).get("status") == 0:  # Success status check
+                    logging.info(f"Line {index + 1} for order ID {created_order_id_validated} created successfully.")
+                    print(f"Line {index + 1} for order ID {created_order_id_validated} created successfully.")
+                else:
+                    logging.error(f"Failed to create line {index + 1}: {response_data}")
+                    print(f"Failed to create line {index + 1}: {response_data}")
+
+            except requests.exceptions.RequestException as e:
+                logging.error(f"Error posting line {index + 1} for order {created_order_id_validated}: {e}")
+                print(f"Error posting line {index + 1} for order {created_order_id_validated}: {e}")
+        else:
+            logging.warning(
+                f"Skipping line {index + 1} due to missing key data: {description}, {quantity}, {unitPrice}")
+            print(f"Skipping line {index + 1} due to missing key data: {description}, {quantity}, {unitPrice}")
+
+    return True  # Indicate success of posting line items
+
+
+# post_order_to_erp_lines(df_line_items, created_oder_date_validated, created_invoice_id_validated, currency_validated, bp_validated,org)
+def upload_file_to_server(pdf_path, remote_file):
+    try:
+        # Initialize the SSH client
+        ssh_client = paramiko.SSHClient()
+        # Automatically add the server's host key if it's not already known
+        ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        # Connect to the server
+        ssh_client.connect(hostname, port=port, username=server_username, password=server_password)
+        logging.info("Connection established with the server.")
+
+        # Use SFTP to transfer the file
+        sftp = ssh_client.open_sftp()
+        sftp.put(pdf_path, remote_file)
+        logging.info(f"File '{pdf_path}' successfully uploaded to '{remote_file}'.")
+        # Close SFTP and SSH connection
+        sftp.close()
+        ssh_client.close()
+        logging.info("Connection closed.")
+    except Exception as e:
+        logging.error(f"An error occurred: {e}")
+
+
+def upload_attachment(server_file_path, pdf_file_name, created_order_id_validated):
+    """
+    Uploads an attachment using a POST request with JSON payload and authentication.
+    """
+    entity = 'ADAttachment'
+    # Construct the full API URL by combining the base URL with the entity
+    api_url = f"{base_url}/"
+    # Prepare the payload with details about the attachment
+    payload = {
+        "data": [
+            {
+                "_entityName": "ADAttachment",
+                "name": pdf_file_name,
+                "path": server_file_path,
+                "table": "259",  # Adjust this as needed
+                "sequenceNumber": 10,
+                "record": created_order_id_validated
+            }
+        ]
+    }
+
+    try:
+        # Send the POST request with authentication and JSON payload
+        response = requests.post(
+            api_url,
+            json=payload,
+            auth=(username, password)
+        )
+
+        # Check if the upload was successful
+        if response.status_code == 200:
+            logging.info("File uploaded successfully!")
+        else:
+            logging.info(f"Failed to upload file. Status code: {response.status_code}")
+
+        return response
+
+    except requests.exceptions.RequestException as e:
+        print(f"An error occurred: {e}")
+        return None
+
+
+def send_email_notification_smtp(erp_url, sender_email, smtp_server, smtp_port, smtp_user, smtp_password):
+    """
+    Send an email notification with a link to the new ERP record using SMTP.
+    """
+
+    msg_receiver_email = ['diana.test@com.solutions', 'eddie@com.solutions']
+    # Create the message
+    message = MIMEMultipart('alternative')
+    message['From'] = sender_email
+    message['To'] = message['To'] = ', '.join(msg_receiver_email)
+    message['Subject'] = 'New Record Created'
+
+    # HTML body with hyperlink
+    html_content = f"""
+    <html>
+        <body>
+            <p>A new Purchase Order record has been created. Please find the link below:</p>
+            <p><a href="{erp_url}">Click here to view the record</a></p>
+        </body>
+    </html>
+    """
+
+    # Attach the HTML content to the email
+    message.attach(MIMEText(html_content, 'html'))
+
+    try:
+        # Establish an SMTP connection and send the email
+        with smtplib.SMTP(smtp_server, smtp_port) as server:
+            server.starttls()  # Upgrade to secure connection
+            server.login(smtp_user, smtp_password)  # Log in to the server
+            server.sendmail(sender_email, receiver_email, message.as_string())  # Send email
+            print(f"Email sent successfully to {receiver_email}")
+    except Exception as e:
+        print(f"Failed to send email: {e}")
+
+
+def send_error_email(error_message, sender_email, receiver_email, smtp_server, smtp_port, smtp_user,
+                     smtp_password):
+    try:
+        # Create the email
+        msg = MIMEMultipart()
+        msg['From'] = sender_email
+        msg['To'] = receiver_email
+        msg['Subject'] = "An error occurred during Processing"
+
+        # Attach the error message
+        body = f"An error occurred during the email processing:\n\n{error_message}"
+        msg.attach(MIMEText(body, 'plain'))
+
+        # Setup the SMTP server and send the email
+        with smtplib.SMTP(smtp_server, smtp_port) as server:
+            server.starttls()  # Secure the connection
+            server.login(smtp_user, smtp_password)
+            server.sendmail(sender_email, receiver_email, msg.as_string())
+        logging.debug("Error email sent successfully.")
+
+    except Exception as e:
+        logging.error(f"Failed to send error email: {e}")
+
+
+def reply_with_error_message(outlook_email):
+    try:
+        # Set up Outlook client
+        outlook = win32.Dispatch("Outlook.Application")
+        reply = outlook_email.Reply()
+
+        # Craft the error message
+        message = (
+            "The PDF file attached appears to be corrupted or too complex to process automatically. "
+            "Please proceed with manual posting for this invoice."
+        )
+
+        # Add message and send reply
+        reply.Body = message
+        reply.Send()
+
+        # Log successful reply
+        logging.info(f"Error message sent to {outlook_email.SenderEmailAddress}")
+
+    except Exception as e:
+        # Log any error that occurs during the reply process
+        print(f"Failed to send error message to {outlook_email.SenderEmailAddress}: {e}")
+        logging.error(f"Failed to send error message to {outlook_email.SenderEmailAddress}: {e}")
+
+'''
+def check_incoming_emails():
+    message = None  # Initialize message to None
+    try:
+        outlook = win32com.client.Dispatch("Outlook.Application").GetNamespace("MAPI")
+        inbox = outlook.Folders("accounts@com.solutions").Folders("Inbox")
+        messages = inbox.Items
+        messages.Sort("[ReceivedTime]", True)  # Sort by most recent first
+        # logging.debug("Checking for unread emails...")
+
+        for message in messages:
+            if message.UnRead:
+                logging.debug(f"Found unread email: {message.Subject}")
+
+                if hasattr(message, "Subject") and hasattr(message, "Attachments"):
+                    subject = message.Subject.lower()  # Convert subject to lowercase for easier matching
+
+                    if message.Attachments.Count > 0:
+                        all_attachments_processed = True
+                        for i in range(1, message.Attachments.Count + 1):
+                            attachment = message.Attachments.Item(i)
+
+                            product_merged_df = pd.DataFrame()
+                            gl_merged_df = pd.DataFrame()
+                            pdf_text, pdf_path, pdf_file_name = process_email(attachment)
+                            print(pdf_file_name)
+                            # print(pdf_text)
+                            if pdf_text:
+                                clean_text = remove_colon(pdf_text)
+                                df_invoice, df_line_items, json_data = generate_structured_json(clean_text)
+                                handle_dataframes(df_invoice, df_line_items)
+                                time.sleep(120)
+                                default_currency_id, default_business_partner_id, default_payment_terms_id, default_price_list_id, default_partnerAddress_id, default_product_id, default_uOM, default_taxCategory, default_warehouse_id, documentType, tax_exempt, default_Costcenter = fetch_default_ids(
+                                    base_url, username, password)
+                                result = check_customer(df_invoice)
+                                org_id = get_org_df(result)
+                                df_businessPartner = get_businessPartner_data_df(org_id)
+                                merged_df = merge_dataframes(df_invoice, df_businessPartner)
+                                #print(merged_df)
+                                bp_id = get_id_from_merged_dataframe(merged_df, org_id, default_business_partner_id)
+                                validated_matched_df = get_dataframe_from_merged_dataframe(merged_df, org_id)
+                                df_OrderExist = order_exist_df(validated_matched_df)
+                                order_exists = check_order_existence(df_OrderExist, bp_id, default_business_partner_id)
+                                if order_exists:
+                                    print("Order Exists")
+                                    message.UnRead = False
+                                    return
+                                bPLocation_id = get_BPLocation_df(bp_id,default_business_partner_id, default_partnerAddress_id)
+
+                                # if window == 'order':
+                                logging.debug('Processing Purchase Order')
+                                created_order_id_validated, created_order_date_validated, currency_validated, bp_validated = post_order_to_erp_and_get_invoice_id_validated(
+                                        validated_matched_df, bPLocation_id, org_id, default_currency_id, default_business_partner_id, default_payment_terms_id, default_price_list_id,default_partnerAddress_id, default_warehouse_id, documentType)
+                                df_Product = get_Product_data_df(org_id)
+                                df_VendorProduct = get_VendorProduct_data_df(org_id)
+                                # product_merged_df = merge_product_dataframes(df_line_items, df_VendorProduct, df_Product, bp_validated, default_product_id)
+                                product_merged_df = merge_line_items_with_products(df_line_items, df_VendorProduct, df_Product, bp_validated, default_product_id)
+                                # product_id, uOM, taxCategory = get_product_info_for_line_item(df_line_items.iloc[0],
+
+                                tax = get_tax_df(product_merged_df)
+                                expense_per_line = calculate_expense_per_line(df_invoice, product_merged_df)
+
+                                posting_lines = post_order_to_erp_lines(product_merged_df,default_warehouse_id, default_product_id,default_uOM, created_order_date_validated, default_taxCategory, created_order_id_validated,
+                                                    currency_validated, bp_validated, org_id, expense_per_line)
+                                #erp_url = f"https://innscor.predictiv.cloud/erp/?tabId=294&recordId={created_order_id_validated}"
+                                erp_url = f"https://openbravo.cloud/test_erp/?tabId=294&recordId={created_order_id_validated}"
+                                print(erp_url)
+                                remote_file = f"/opt/PredictivERP-innscor_test/attachments/InvoiceAttachments/{pdf_file_name}"
+                                #remote_file = f"/opt/PredictivERP/attachments/InvoiceAttachments/{pdf_file_name}"
+                                upload_file_to_server(pdf_path, remote_file)
+                                server_file_path = "InvoiceAttachments"
+                                upload_attachment(server_file_path, pdf_file_name, created_order_id_validated)
+                                # Send notification email
+                                send_email_notification_smtp(erp_url, sender_email, smtp_server,
+                                                                 smtp_port, smtp_user, smtp_password)
+
+                                # Mark email as read after processing
+                                #message.UnRead = False
+                            else:
+                                logging.debug(f"No text extracted from PDF in email: {message.Subject}")
+                        else:
+                            logging.debug(f"Attachment {message.Subject} is not a PDF, skipping.")
+                    message.UnRead = False
+                else:
+                    logging.debug(f"Email subject does not contain 'invoice': {message.Subject}")
+            else:
+                logging.debug(f"Skipping read email: {message.Subject}")
+    except Exception as e:
+        
+        # reply_message = reply_with_error_message(message)
+        error_message = traceback.format_exc()  # Get the full traceback of the error
+        logging.error(f"Failed to check incoming emails: {e}")
+        if message:  # Only attempt to reply if message is defined
+            # reply_message = reply_with_error_message(message)
+            message.UnRead = False
+        message.UnRead = False
+        # Send error email   
+        
+        send_error_email(error_message, sender_email=sender_email,
+                         receiver_email=receiver_email, smtp_server=smtp_server, smtp_port=smtp_port,
+                         smtp_user=smtp_user, smtp_password=smtp_password)
+
+        
+'''
+
+
+import win32com.client
+import pandas as pd
+import logging
+import traceback
+import time
+
+# Configure logging
+logging.basicConfig(level=logging.DEBUG, format="%(asctime)s - %(levelname)s - %(message)s")
+
+def check_incoming_emails():
+    try:
+        outlook = win32com.client.Dispatch("Outlook.Application").GetNamespace("MAPI")
+        inbox = outlook.Folders("accounts@com.solutions").Folders("Inbox")
+        messages = inbox.Items
+        messages.Sort("[ReceivedTime]", True)  # Sort by most recent first
+        logging.info("Checking for unread emails...")
+
+        for message in messages:
+            if message.UnRead:
+                logging.info(f"Processing email: {message.Subject}")
+
+                if hasattr(message, "Subject") and hasattr(message, "Attachments"):
+                    # Iterate through all attachments
+                    for i in range(1, message.Attachments.Count + 1):
+                        attachment = message.Attachments.Item(i)
+                        attachment_name = attachment.FileName
+
+                        try:
+                            logging.info(f"Processing attachment {i}/{message.Attachments.Count}: {attachment_name}")
+
+                            # Skip non-PDF files
+                            if not attachment_name.lower().endswith(".pdf"):
+                                logging.warning(f"Skipping non-PDF attachment: {attachment_name}")
+                                continue
+
+                            # Process the PDF attachment
+                            pdf_text, pdf_path, pdf_file_name = process_email(attachment)
+                            if pdf_text:
+                                logging.info(f"Successfully processed attachment: {attachment_name}")
+                                clean_text = remove_colon(pdf_text)
+                                df_invoice, df_line_items, json_data = generate_structured_json(clean_text)
+                                handle_dataframes(df_invoice, df_line_items)
+
+                                # Simulated delay for processing
+                                time.sleep(120)
+
+                                # Fetch default IDs and other configurations
+                                default_currency_id, default_business_partner_id, default_payment_terms_id, \
+                                    default_price_list_id, default_partnerAddress_id, default_product_id, \
+                                    default_uOM, default_taxCategory, default_warehouse_id, documentType, \
+                                    tax_exempt, default_Costcenter = fetch_default_ids(
+                                    base_url, username, password)
+
+                                # Process invoice data
+                                result = check_customer(df_invoice)
+                                org_id = get_org_df(result)
+                                df_businessPartner = get_businessPartner_data_df(org_id)
+                                merged_df = merge_dataframes(df_invoice, df_businessPartner)
+                                bp_id = get_id_from_merged_dataframe(merged_df, org_id, default_business_partner_id)
+                                validated_matched_df = get_dataframe_from_merged_dataframe(merged_df, org_id)
+                                df_OrderExist = order_exist_df(validated_matched_df)
+                                order_exists = check_order_existence(df_OrderExist, bp_id, default_business_partner_id)
+
+                                if order_exists:
+                                    logging.info("Order already exists. Skipping further processing for this email.")
+                                    continue
+
+                                # Process purchase order
+                                bPLocation_id = get_BPLocation_df(bp_id, default_business_partner_id, default_partnerAddress_id)
+                                created_order_id_validated, created_order_date_validated, currency_validated, bp_validated = \
+                                    post_order_to_erp_and_get_invoice_id_validated(
+                                        validated_matched_df, bPLocation_id, org_id, default_currency_id,
+                                        default_business_partner_id, default_payment_terms_id, default_price_list_id,
+                                        default_partnerAddress_id, default_warehouse_id, documentType)
+
+                                # Merge product data
+                                df_Product = get_Product_data_df(org_id)
+                                df_VendorProduct = get_VendorProduct_data_df(org_id)
+                                product_merged_df = merge_line_items_with_products(
+                                    df_line_items, df_VendorProduct, df_Product, bp_validated, default_product_id)
+
+                                tax = get_tax_df(product_merged_df)
+                                expense_per_line = calculate_expense_per_line(df_invoice, product_merged_df)
+
+                                # Post order lines to ERP
+                                posting_lines = post_order_to_erp_lines(
+                                    product_merged_df, default_warehouse_id, default_product_id, default_uOM,
+                                    created_order_date_validated, default_taxCategory, created_order_id_validated,
+                                    currency_validated, bp_validated, org_id, expense_per_line)
+
+                                # Construct ERP URL
+                                erp_url = f"https://openbravo.cloud/test_erp/?tabId=294&recordId={created_order_id_validated}"
+                                logging.info(f"ERP URL: {erp_url}")
+
+                                # Upload file to server
+                                remote_file = f"/opt/PredictivERP-innscor_test/attachments/InvoiceAttachments/{pdf_file_name}"
+                                upload_file_to_server(pdf_path, remote_file)
+                                server_file_path = "InvoiceAttachments"
+                                upload_attachment(server_file_path, pdf_file_name, created_order_id_validated)
+
+                                # Send notification email
+                                send_email_notification_smtp(
+                                    erp_url, sender_email, smtp_server, smtp_port, smtp_user, smtp_password)
+
+                            else:
+                                logging.warning(f"No text extracted from PDF: {attachment_name}")
+
+                        except Exception as attachment_error:
+                            logging.error(f"Error processing attachment {attachment_name}: {attachment_error}")
+                            continue  # Skip to the next attachment
+
+                    # Mark email as read after processing all attachments
+                    message.UnRead = False
+                else:
+                    logging.warning(f"Email is missing required properties: {message.Subject}")
+            else:
+                logging.info(f"Skipping read email: {message.Subject}")
+
+    except Exception as e:
+        error_message = traceback.format_exc()  # Get the full traceback of the error
+        logging.error(f"Failed to check incoming emails: {e}")
+        # reply_message = reply_with_error_message(message)
+        error_message = traceback.format_exc()  # Get the full traceback of the error
+        logging.error(f"Failed to check incoming emails: {e}")
+        if message:  # Only attempt to reply if message is defined
+            # reply_message = reply_with_error_message(message)
+            message.UnRead = False
+        message.UnRead = False
+        # Send error email
+
+        send_error_email(error_message, sender_email=sender_email,
+                         receiver_email=receiver_email, smtp_server=smtp_server, smtp_port=smtp_port,
+                         smtp_user=smtp_user, smtp_password=smtp_password)
+
+
+# if __name__ == "__main__":
+check_incoming_emails()
+
+
+# In[ ]:
+
+
+
+
